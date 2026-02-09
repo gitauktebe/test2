@@ -6,6 +6,7 @@ Telegram-бот для сбора фото и пересылки в целеву
 
 - `supabase/functions/tg-webhook/index.ts` — webhook-обработчик Telegram.
 - `supabase/migrations/0001_bot_state.sql` — таблица состояния.
+- `supabase/migrations/0002_tg_updates.sql` — таблица дедупликации обновлений.
 
 ## Переменные окружения
 
@@ -55,3 +56,9 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 
 - `/start` — начать диалог.
 - `/cancel` — сбросить текущий черновик.
+
+## Минимальный тест (альбом 14 фото)
+
+1. Откройте диалог с ботом, выполните `/start`, выберите "Отправить фото" и дойдите до шага отправки фото.
+2. В Telegram выделите 14 фотографий и отправьте их одним альбомом (media group).
+3. Проверьте целевой чат: бот должен отправить 2 чанка (10 + 4) без ошибок 500 в логах webhook.
