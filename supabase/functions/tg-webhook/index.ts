@@ -2,10 +2,22 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 type Submission = {
+  id: string;
   user_id: number;
-  state: string;
-  payload: Record<string, unknown>;
+  chat_id: number;
+  created_at: string;
+  event_date: string | null;
+  event_type: string | null;
+  custom_event_type: string | null;
+  sport: string | null;
+  gender: string | null;
+  stage: string | null;
+  phase: string | null;
   photo_file_ids: string[];
+  status: string;
+  attempts: number;
+  next_retry_at: string | null;
+  last_error: string | null;
 };
 
 type TelegramMessage = {
@@ -31,7 +43,7 @@ const START_KEYBOARD = {
 };
 
 const PHOTO_ACTIONS_KEYBOARD = {
-  keyboard: [[{ text: "➕ Добавить фото" }, { text: "✅ Готово, отправить" }], [{ text: "❌ Отмена" }]],
+  keyboard: [[{ text: "Готово ✅" }, { text: "Отмена" }]],
   resize_keyboard: true,
 };
 
@@ -49,7 +61,6 @@ const GENDER_OPTIONS = ["Девочки", "Мальчики"];
 const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 
-const MAX_PHOTOS = 60;
 const RECOMMENDED_PHOTOS = 25;
 const PHOTO_ACK_EVERY = 5;
 
@@ -67,17 +78,6 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 const botToken = getEnv("TELEGRAM_BOT_TOKEN");
 const targetChatId = getEnv("TG_TARGET_CHAT_ID");
-
-const MEDIA_GROUP_CHUNK_DELAY_MIN_MS = 200;
-const MEDIA_GROUP_CHUNK_DELAY_MAX_MS = 400;
-
-function randomBetween(minMs: number, maxMs: number) {
-  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function callTelegram(method: string, body: Record<string, unknown>) {
   const response = await fetch(`${TELEGRAM_API}/bot${botToken}/${method}`, {
@@ -102,50 +102,6 @@ async function sendMessage(chatId: number | string, text: string, replyMarkup?: 
   });
 }
 
-async function sendMediaGroup(
-  chatId: number | string,
-  fileIds: string[],
-  logContext?: { updateId?: number; mediaGroupId?: string },
-) {
-  if (!fileIds.length) return;
-  const chunks: string[][] = [];
-  for (let i = 0; i < fileIds.length; i += 10) {
-    chunks.push(fileIds.slice(i, i + 10));
-  }
-
-  console.log(
-    "sendMediaGroup",
-    JSON.stringify({
-      update_id: logContext?.updateId,
-      media_group_id: logContext?.mediaGroupId,
-      total_photos: fileIds.length,
-      chunk_count: chunks.length,
-    }),
-  );
-
-  for (const [index, chunk] of chunks.entries()) {
-    const media = chunk.map((fileId) => ({ type: "photo", media: fileId }));
-    await callTelegram("sendMediaGroup", { chat_id: chatId, media });
-    if (index < chunks.length - 1) {
-      await delay(randomBetween(MEDIA_GROUP_CHUNK_DELAY_MIN_MS, MEDIA_GROUP_CHUNK_DELAY_MAX_MS));
-    }
-  }
-}
-
-async function sendPhotos(chatId: number | string, fileIds: string[], logContext?: { updateId?: number }) {
-  try {
-    await sendMediaGroup(chatId, fileIds, logContext);
-    return;
-  } catch (error) {
-    console.error("sendMediaGroup failed, fallback to single sends", error);
-  }
-
-  for (const fileId of fileIds) {
-    await callTelegram("sendPhoto", { chat_id: chatId, photo: fileId });
-    await delay(randomBetween(MEDIA_GROUP_CHUNK_DELAY_MIN_MS, MEDIA_GROUP_CHUNK_DELAY_MAX_MS));
-  }
-}
-
 async function dedupeUpdate(updateId: number) {
   const { error } = await supabase.from("tg_updates").insert({ update_id: updateId });
   if (error) {
@@ -157,63 +113,117 @@ async function dedupeUpdate(updateId: number) {
   return false;
 }
 
-async function getSubmission(userId: number): Promise<Submission> {
+async function getActiveSubmission(userId: number): Promise<Submission | null> {
   const { data, error } = await supabase
     .from("bot_submissions")
-    .select("user_id,state,payload,photo_file_ids")
+    .select(
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,status,attempts,next_retry_at,last_error",
+    )
     .eq("user_id", userId)
+    .in("status", ["collecting", "pending_send", "sending"])
+    .order("created_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
 
   if (error) {
     throw new Error(`Failed to load submission: ${error.message}`);
   }
 
-  if (data) {
-    return {
-      user_id: data.user_id as number,
-      state: data.state as string,
-      payload: (data.payload as Record<string, unknown>) ?? {},
-      photo_file_ids: (data.photo_file_ids as string[]) ?? [],
-    };
+  if (!data) {
+    return null;
   }
 
   return {
-    user_id: userId,
-    state: "idle",
-    payload: {},
-    photo_file_ids: [],
+    id: data.id as string,
+    user_id: data.user_id as number,
+    chat_id: data.chat_id as number,
+    created_at: data.created_at as string,
+    event_date: (data.event_date as string | null) ?? null,
+    event_type: (data.event_type as string | null) ?? null,
+    custom_event_type: (data.custom_event_type as string | null) ?? null,
+    sport: (data.sport as string | null) ?? null,
+    gender: (data.gender as string | null) ?? null,
+    stage: (data.stage as string | null) ?? null,
+    phase: (data.phase as string | null) ?? null,
+    photo_file_ids: (data.photo_file_ids as string[]) ?? [],
+    status: data.status as string,
+    attempts: (data.attempts as number) ?? 0,
+    next_retry_at: (data.next_retry_at as string | null) ?? null,
+    last_error: (data.last_error as string | null) ?? null,
   };
 }
 
-async function saveSubmission(submission: Submission) {
-  const { error } = await supabase.from("bot_submissions").upsert({
-    user_id: submission.user_id,
-    state: submission.state,
-    payload: submission.payload,
-    photo_file_ids: submission.photo_file_ids,
-    updated_at: new Date().toISOString(),
-  });
+async function createSubmission(userId: number, chatId: number): Promise<Submission> {
+  const { data, error } = await supabase
+    .from("bot_submissions")
+    .insert({
+      user_id: userId,
+      chat_id: chatId,
+      status: "collecting",
+      photo_file_ids: [],
+    })
+    .select(
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,status,attempts,next_retry_at,last_error",
+    )
+    .single();
+
+  if (error) {
+    throw new Error(`Failed to create submission: ${error.message}`);
+  }
+
+  return {
+    id: data.id as string,
+    user_id: data.user_id as number,
+    chat_id: data.chat_id as number,
+    created_at: data.created_at as string,
+    event_date: (data.event_date as string | null) ?? null,
+    event_type: (data.event_type as string | null) ?? null,
+    custom_event_type: (data.custom_event_type as string | null) ?? null,
+    sport: (data.sport as string | null) ?? null,
+    gender: (data.gender as string | null) ?? null,
+    stage: (data.stage as string | null) ?? null,
+    phase: (data.phase as string | null) ?? null,
+    photo_file_ids: (data.photo_file_ids as string[]) ?? [],
+    status: data.status as string,
+    attempts: (data.attempts as number) ?? 0,
+    next_retry_at: (data.next_retry_at as string | null) ?? null,
+    last_error: (data.last_error as string | null) ?? null,
+  };
+}
+
+async function updateSubmission(submission: Submission) {
+  const { error } = await supabase
+    .from("bot_submissions")
+    .update({
+      event_date: submission.event_date,
+      event_type: submission.event_type,
+      custom_event_type: submission.custom_event_type,
+      sport: submission.sport,
+      gender: submission.gender,
+      stage: submission.stage,
+      phase: submission.phase,
+      photo_file_ids: submission.photo_file_ids,
+      status: submission.status,
+      attempts: submission.attempts,
+      next_retry_at: submission.next_retry_at,
+      last_error: submission.last_error,
+    })
+    .eq("id", submission.id);
 
   if (error) {
     throw new Error(`Failed to save submission: ${error.message}`);
   }
 }
 
-function formatFinalText(payload: Record<string, unknown>) {
-  const typeValue = (payload.custom_type as string | undefined) ?? (payload.type as string | undefined) ?? "-";
-  const dateValue = (payload.date as string | undefined) ?? "-";
-  const disciplineValue = (payload.discipline as string | undefined) ?? "-";
-  const genderValue = (payload.gender as string | undefined) ?? "-";
-  const stageValue = (payload.stage as string | undefined) ?? "-";
-  const phaseValue = (payload.phase as string | undefined) ?? "-";
-  return [
-    `[${dateValue}]`,
-    typeValue,
-    disciplineValue,
-    genderValue,
-    stageValue,
-    phaseValue,
-  ].join("\n");
+function getSubmissionStep(submission: Submission) {
+  if (!submission.event_date) return "await_date";
+  if (!submission.event_type) return "await_type";
+  if (submission.event_type === "Свой вариант" && !submission.custom_event_type) return "await_custom_type";
+  if (!submission.sport) return "await_sport";
+  if (!submission.gender) return "await_gender";
+  if (!submission.stage) return "await_stage";
+  if (!submission.phase) return "await_phase";
+  return "await_photos";
 }
 
 function isValidDate(text: string) {
@@ -245,59 +255,80 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
   }
 
   const userId = message.from.id;
-  const submission = await getSubmission(userId);
+  const chatId = message.chat.id;
+  const submission = await getActiveSubmission(userId);
   const text = message.text?.trim();
 
   if (text === "/start") {
-    submission.state = "idle";
-    submission.payload = {};
-    submission.photo_file_ids = [];
-    await saveSubmission(submission);
+    if (submission) {
+      submission.status = "failed";
+      submission.last_error = "cancelled_by_user";
+      await updateSubmission(submission);
+    }
     await sendMessage(userId, "Привет! Готов принять подборку.", START_KEYBOARD);
     return;
   }
 
   if (text === "/cancel") {
-    submission.state = "idle";
-    submission.payload = {};
-    submission.photo_file_ids = [];
-    await saveSubmission(submission);
+    if (submission) {
+      submission.status = "failed";
+      submission.last_error = "cancelled_by_user";
+      await updateSubmission(submission);
+    }
     await sendMessage(userId, "Диалог сброшен. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
     return;
   }
 
-  if (text === "❌ Отмена") {
-    submission.state = "idle";
-    submission.payload = {};
-    submission.photo_file_ids = [];
-    await saveSubmission(submission);
+  if (text === "Отмена") {
+    if (submission) {
+      submission.status = "failed";
+      submission.last_error = "cancelled_by_user";
+      await updateSubmission(submission);
+    }
     await sendMessage(userId, "Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
     return;
   }
 
   if (text === "Отправить фото") {
-    submission.state = "await_date";
-    submission.payload = {};
-    submission.photo_file_ids = [];
-    await saveSubmission(submission);
+    if (submission && submission.status !== "collecting") {
+      await sendMessage(userId, "Подборка уже отправляется. Пожалуйста, подождите.", PHOTO_ACTIONS_KEYBOARD);
+      return;
+    }
+    if (submission && submission.status === "collecting") {
+      submission.status = "failed";
+      submission.last_error = "restart_by_user";
+      await updateSubmission(submission);
+    }
+    await createSubmission(userId, chatId);
     await sendMessage(userId, "Укажите дату (дд.мм.гг или дд.мм.гггг):");
     return;
   }
 
-  if (submission.state === "sending") {
+  if (!submission) {
+    await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
+    return;
+  }
+
+  if (submission.status === "pending_send" || submission.status === "sending") {
     await sendMessage(userId, "Подборка уже отправляется. Пожалуйста, подождите.", PHOTO_ACTIONS_KEYBOARD);
     return;
   }
 
-  if (submission.state === "await_date") {
+  if (submission.status !== "collecting") {
+    await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
+    return;
+  }
+
+  const step = getSubmissionStep(submission);
+
+  if (step === "await_date") {
     if (!text || !isValidDate(text)) {
       await sendMessage(userId, "Дата должна быть в формате дд.мм.гг или дд.мм.гггг. Попробуйте ещё раз:");
       return;
     }
 
-    submission.payload = { ...submission.payload, date: text };
-    submission.state = "await_type";
-    await saveSubmission(submission);
+    submission.event_date = text;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите тип:", {
       keyboard: TYPE_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -306,23 +337,23 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_type") {
+  if (step === "await_type") {
     if (!text || !TYPE_OPTIONS.includes(text)) {
       await sendMessage(userId, "Пожалуйста, выберите тип из списка кнопок.");
       return;
     }
 
     if (text === "Свой вариант") {
-      submission.state = "await_custom_type";
-      submission.payload = { ...submission.payload, type: text };
-      await saveSubmission(submission);
+      submission.event_type = text;
+      submission.custom_event_type = null;
+      await updateSubmission(submission);
       await sendMessage(userId, "Введите свой вариант типа:");
       return;
     }
 
-    submission.payload = { ...submission.payload, type: text };
-    submission.state = "await_discipline";
-    await saveSubmission(submission);
+    submission.event_type = text;
+    submission.custom_event_type = null;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите дисциплину:", {
       keyboard: DISCIPLINE_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -331,15 +362,14 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_custom_type") {
+  if (step === "await_custom_type") {
     if (!text) {
       await sendMessage(userId, "Введите текст своего варианта:");
       return;
     }
 
-    submission.payload = { ...submission.payload, custom_type: text };
-    submission.state = "await_discipline";
-    await saveSubmission(submission);
+    submission.custom_event_type = text;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите дисциплину:", {
       keyboard: DISCIPLINE_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -348,18 +378,14 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_discipline") {
+  if (step === "await_sport") {
     if (!text || !DISCIPLINE_OPTIONS.includes(text)) {
       await sendMessage(userId, "Пожалуйста, выберите дисциплину из списка кнопок.");
       return;
     }
 
-    submission.payload = {
-      ...submission.payload,
-      discipline: text === "Пропустить" ? "-" : text,
-    };
-    submission.state = "await_gender";
-    await saveSubmission(submission);
+    submission.sport = text === "Пропустить" ? null : text;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите категорию:", {
       keyboard: GENDER_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -368,15 +394,14 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_gender") {
+  if (step === "await_gender") {
     if (!text || !GENDER_OPTIONS.includes(text)) {
       await sendMessage(userId, "Пожалуйста, выберите из кнопок: Девочки или Мальчики.");
       return;
     }
 
-    submission.payload = { ...submission.payload, gender: text };
-    submission.state = "await_stage";
-    await saveSubmission(submission);
+    submission.gender = text;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите этап:", {
       keyboard: STAGE_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -385,15 +410,14 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_stage") {
+  if (step === "await_stage") {
     if (!text || !STAGE_OPTIONS.includes(text)) {
       await sendMessage(userId, "Пожалуйста, выберите этап из списка кнопок.");
       return;
     }
 
-    submission.payload = { ...submission.payload, stage: text };
-    submission.state = "await_phase";
-    await saveSubmission(submission);
+    submission.stage = text;
+    await updateSubmission(submission);
     await sendMessage(userId, "Выберите стадию:", {
       keyboard: PHASE_OPTIONS.map((option) => [{ text: option }]),
       resize_keyboard: true,
@@ -402,15 +426,14 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_phase") {
+  if (step === "await_phase") {
     if (!text || !PHASE_OPTIONS.includes(text)) {
       await sendMessage(userId, "Пожалуйста, выберите стадию из списка кнопок.");
       return;
     }
 
-    submission.payload = { ...submission.payload, phase: text };
-    submission.state = "await_photos";
-    await saveSubmission(submission);
+    submission.phase = text;
+    await updateSubmission(submission);
     await sendMessage(
       userId,
       `Рекомендуем минимум ${RECOMMENDED_PHOTOS} фото хорошего качества (можно меньше)`,
@@ -419,20 +442,16 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.state === "await_photos") {
-    if (text === "➕ Добавить фото") {
-      await sendMessage(userId, "Отправьте фото (можно альбомом).", PHOTO_ACTIONS_KEYBOARD);
-      return;
-    }
-
-    if (text === "✅ Готово, отправить") {
+  if (step === "await_photos") {
+    if (text === "Готово ✅") {
       if (submission.photo_file_ids.length === 0) {
-        await sendMessage(userId, "Пока нет фото. Нажмите «➕ Добавить фото» и отправьте изображения.");
+        await sendMessage(userId, "Пока нет фото. Отправьте изображения и нажмите «Готово ✅».");
         return;
       }
 
-      submission.state = "sending";
-      await saveSubmission(submission);
+      submission.status = "pending_send";
+      submission.next_retry_at = null;
+      await updateSubmission(submission);
       console.log(
         "submissionSending",
         JSON.stringify({
@@ -442,43 +461,15 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
         }),
       );
 
-      try {
-        const finalText = formatFinalText(submission.payload);
-        await sendMessage(targetChatId, finalText);
-        await sendPhotos(targetChatId, submission.photo_file_ids, { updateId });
-
-        submission.state = "idle";
-        submission.payload = {};
-        submission.photo_file_ids = [];
-        await saveSubmission(submission);
-
-        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
-      } catch (error) {
-        console.error("Failed to отправить подборку", error);
-        submission.state = "await_photos";
-        await saveSubmission(submission);
-        await sendMessage(
-          userId,
-          "Не удалось отправить подборку. Проверьте соединение и попробуйте ещё раз.",
-          PHOTO_ACTIONS_KEYBOARD,
-        );
-      }
+      await sendMessage(userId, "Отправляю…");
       return;
     }
 
     if (message.photo && message.photo.length > 0) {
-      if (submission.photo_file_ids.length >= MAX_PHOTOS) {
-        await sendMessage(
-          userId,
-          `Достигнут лимит ${MAX_PHOTOS} фото. Отправьте оставшиеся следующей заявкой.`,
-          PHOTO_ACTIONS_KEYBOARD,
-        );
-        return;
-      }
       const photoId = pickLargestPhotoId(message.photo);
       if (photoId) {
         submission.photo_file_ids = [...submission.photo_file_ids, photoId];
-        await saveSubmission(submission);
+        await updateSubmission(submission);
         const count = submission.photo_file_ids.length;
         if (count === 1 || count % PHOTO_ACK_EVERY === 0) {
           await sendMessage(userId, `Фото ${count} принято. Ещё?`, PHOTO_ACTIONS_KEYBOARD);
@@ -487,8 +478,21 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
       return;
     }
 
-    await sendMessage(userId, "Ожидаю фото или кнопку «✅ Готово, отправить».");
+    await sendMessage(userId, "Ожидаю фото или кнопку «Готово ✅».");
     return;
+  }
+
+  if (message.photo && message.photo.length > 0) {
+    const photoId = pickLargestPhotoId(message.photo);
+    if (photoId) {
+      submission.photo_file_ids = [...submission.photo_file_ids, photoId];
+      await updateSubmission(submission);
+      const count = submission.photo_file_ids.length;
+      if (count === 1 || count % PHOTO_ACK_EVERY === 0) {
+        await sendMessage(userId, `Фото ${count} принято. Ещё?`, PHOTO_ACTIONS_KEYBOARD);
+      }
+      return;
+    }
   }
 
   await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
