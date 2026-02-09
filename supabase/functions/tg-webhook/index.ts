@@ -30,8 +30,8 @@ const START_KEYBOARD = {
   one_time_keyboard: true,
 };
 
-const DONE_KEYBOARD = {
-  keyboard: [[{ text: "Готово ✅" }]],
+const PHOTO_ACTIONS_KEYBOARD = {
+  keyboard: [[{ text: "➕ Добавить фото" }, { text: "✅ Готово, отправить" }], [{ text: "❌ Отмена" }]],
   resize_keyboard: true,
 };
 
@@ -49,6 +49,10 @@ const GENDER_OPTIONS = ["Девочки", "Мальчики"];
 const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 
+const MAX_PHOTOS = 60;
+const RECOMMENDED_PHOTOS = 25;
+const PHOTO_ACK_EVERY = 5;
+
 function getEnv(name: string): string {
   const value = Deno.env.get(name);
   if (!value) {
@@ -64,19 +68,8 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 const botToken = getEnv("TELEGRAM_BOT_TOKEN");
 const targetChatId = getEnv("TG_TARGET_CHAT_ID");
 
-const MEDIA_GROUP_FLUSH_MIN_MS = 1500;
-const MEDIA_GROUP_FLUSH_MAX_MS = 2000;
 const MEDIA_GROUP_CHUNK_DELAY_MIN_MS = 200;
 const MEDIA_GROUP_CHUNK_DELAY_MAX_MS = 400;
-
-type MediaGroupBuffer = {
-  chatId: number | string;
-  userId: number;
-  fileIds: string[];
-  timerId?: number;
-};
-
-const mediaGroupBuffers = new Map<string, MediaGroupBuffer>();
 
 function randomBetween(minMs: number, maxMs: number) {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -114,6 +107,7 @@ async function sendMediaGroup(
   fileIds: string[],
   logContext?: { updateId?: number; mediaGroupId?: string },
 ) {
+  if (!fileIds.length) return;
   const chunks: string[][] = [];
   for (let i = 0; i < fileIds.length; i += 10) {
     chunks.push(fileIds.slice(i, i + 10));
@@ -135,6 +129,20 @@ async function sendMediaGroup(
     if (index < chunks.length - 1) {
       await delay(randomBetween(MEDIA_GROUP_CHUNK_DELAY_MIN_MS, MEDIA_GROUP_CHUNK_DELAY_MAX_MS));
     }
+  }
+}
+
+async function sendPhotos(chatId: number | string, fileIds: string[], logContext?: { updateId?: number }) {
+  try {
+    await sendMediaGroup(chatId, fileIds, logContext);
+    return;
+  } catch (error) {
+    console.error("sendMediaGroup failed, fallback to single sends", error);
+  }
+
+  for (const fileId of fileIds) {
+    await callTelegram("sendPhoto", { chat_id: chatId, photo: fileId });
+    await delay(randomBetween(MEDIA_GROUP_CHUNK_DELAY_MIN_MS, MEDIA_GROUP_CHUNK_DELAY_MAX_MS));
   }
 }
 
@@ -191,20 +199,21 @@ async function saveSubmission(submission: Submission) {
   }
 }
 
-function formatSummary(payload: Record<string, unknown>, photoCount: number) {
-  const lines = [
-    "Новая фото-подборка:",
-    `Дата: ${payload.date ?? "-"}`,
-    `Тип: ${payload.type ?? "-"}`,
-    payload.custom_type ? `Свой вариант: ${payload.custom_type}` : null,
-    `Дисциплина: ${payload.discipline ?? "-"}`,
-    `Пол: ${payload.gender ?? "-"}`,
-    `Этап: ${payload.stage ?? "-"}`,
-    `Стадия: ${payload.phase ?? "-"}`,
-    `Фото: ${photoCount}`,
-  ].filter(Boolean);
-
-  return lines.join("\n");
+function formatFinalText(payload: Record<string, unknown>) {
+  const typeValue = (payload.custom_type as string | undefined) ?? (payload.type as string | undefined) ?? "-";
+  const dateValue = (payload.date as string | undefined) ?? "-";
+  const disciplineValue = (payload.discipline as string | undefined) ?? "-";
+  const genderValue = (payload.gender as string | undefined) ?? "-";
+  const stageValue = (payload.stage as string | undefined) ?? "-";
+  const phaseValue = (payload.phase as string | undefined) ?? "-";
+  return [
+    `[${dateValue}]`,
+    typeValue,
+    disciplineValue,
+    genderValue,
+    stageValue,
+    phaseValue,
+  ].join("\n");
 }
 
 function isValidDate(text: string) {
@@ -224,55 +233,6 @@ async function notifyAdminError(error: unknown) {
   } catch (sendError) {
     console.error("Failed to notify admin", sendError);
   }
-}
-
-async function flushMediaGroup(mediaGroupId: string, logContext?: { updateId?: number }) {
-  const buffer = mediaGroupBuffers.get(mediaGroupId);
-  if (!buffer) return;
-  mediaGroupBuffers.delete(mediaGroupId);
-  console.log(
-    "flushMediaGroup",
-    JSON.stringify({
-      update_id: logContext?.updateId,
-      media_group_id: mediaGroupId,
-      user_id: buffer.userId,
-      photo_count: buffer.fileIds.length,
-    }),
-  );
-  await sendMediaGroup(buffer.chatId, buffer.fileIds, {
-    updateId: logContext?.updateId,
-    mediaGroupId,
-  });
-}
-
-function bufferMediaGroup(
-  mediaGroupId: string,
-  fileId: string,
-  userId: number,
-  chatId: number | string,
-  logContext?: { updateId?: number },
-) {
-  const existing = mediaGroupBuffers.get(mediaGroupId);
-  const buffer: MediaGroupBuffer = existing ?? { chatId, userId, fileIds: [] };
-  buffer.fileIds.push(fileId);
-  if (buffer.timerId) {
-    clearTimeout(buffer.timerId);
-  }
-  buffer.timerId = setTimeout(() => {
-    flushMediaGroup(mediaGroupId, logContext).catch((error) => {
-      console.error("Failed to flush media group", error);
-    });
-  }, randomBetween(MEDIA_GROUP_FLUSH_MIN_MS, MEDIA_GROUP_FLUSH_MAX_MS));
-  mediaGroupBuffers.set(mediaGroupId, buffer);
-  console.log(
-    "bufferMediaGroup",
-    JSON.stringify({
-      update_id: logContext?.updateId,
-      media_group_id: mediaGroupId,
-      user_id: userId,
-      buffered_count: buffer.fileIds.length,
-    }),
-  );
 }
 
 async function handleMessage(message: TelegramMessage, updateId: number) {
@@ -306,12 +266,26 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
+  if (text === "❌ Отмена") {
+    submission.state = "idle";
+    submission.payload = {};
+    submission.photo_file_ids = [];
+    await saveSubmission(submission);
+    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
+    return;
+  }
+
   if (text === "Отправить фото") {
     submission.state = "await_date";
     submission.payload = {};
     submission.photo_file_ids = [];
     await saveSubmission(submission);
     await sendMessage(userId, "Укажите дату (дд.мм.гг или дд.мм.гггг):");
+    return;
+  }
+
+  if (submission.state === "sending") {
+    await sendMessage(userId, "Подборка уже отправляется. Пожалуйста, подождите.", PHOTO_ACTIONS_KEYBOARD);
     return;
   }
 
@@ -439,48 +413,81 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     await saveSubmission(submission);
     await sendMessage(
       userId,
-      "Отправьте минимум 25 фото (можно альбомом). Когда закончите, нажмите кнопку Готово ✅.",
-      DONE_KEYBOARD,
+      `Рекомендуем минимум ${RECOMMENDED_PHOTOS} фото хорошего качества (можно меньше)`,
+      PHOTO_ACTIONS_KEYBOARD,
     );
     return;
   }
 
   if (submission.state === "await_photos") {
-    if (text === "Готово ✅") {
-      if (submission.photo_file_ids.length < 25) {
-        await sendMessage(
-          userId,
-          `Сейчас ${submission.photo_file_ids.length}. Нужно минимум 25 фото. Продолжайте отправку.`,
-        );
+    if (text === "➕ Добавить фото") {
+      await sendMessage(userId, "Отправьте фото (можно альбомом).", PHOTO_ACTIONS_KEYBOARD);
+      return;
+    }
+
+    if (text === "✅ Готово, отправить") {
+      if (submission.photo_file_ids.length === 0) {
+        await sendMessage(userId, "Пока нет фото. Нажмите «➕ Добавить фото» и отправьте изображения.");
         return;
       }
 
-      const summary = formatSummary(submission.payload, submission.photo_file_ids.length);
-      await sendMessage(targetChatId, summary);
-      await sendMediaGroup(targetChatId, submission.photo_file_ids);
-
-      submission.state = "idle";
-      submission.payload = {};
-      submission.photo_file_ids = [];
+      submission.state = "sending";
       await saveSubmission(submission);
+      console.log(
+        "submissionSending",
+        JSON.stringify({
+          update_id: updateId,
+          user_id: userId,
+          photo_count: submission.photo_file_ids.length,
+        }),
+      );
 
-      await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
+      try {
+        const finalText = formatFinalText(submission.payload);
+        await sendMessage(targetChatId, finalText);
+        await sendPhotos(targetChatId, submission.photo_file_ids, { updateId });
+
+        submission.state = "idle";
+        submission.payload = {};
+        submission.photo_file_ids = [];
+        await saveSubmission(submission);
+
+        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
+      } catch (error) {
+        console.error("Failed to отправить подборку", error);
+        submission.state = "await_photos";
+        await saveSubmission(submission);
+        await sendMessage(
+          userId,
+          "Не удалось отправить подборку. Проверьте соединение и попробуйте ещё раз.",
+          PHOTO_ACTIONS_KEYBOARD,
+        );
+      }
       return;
     }
 
     if (message.photo && message.photo.length > 0) {
+      if (submission.photo_file_ids.length >= MAX_PHOTOS) {
+        await sendMessage(
+          userId,
+          `Достигнут лимит ${MAX_PHOTOS} фото. Отправьте оставшиеся следующей заявкой.`,
+          PHOTO_ACTIONS_KEYBOARD,
+        );
+        return;
+      }
       const photoId = pickLargestPhotoId(message.photo);
       if (photoId) {
         submission.photo_file_ids = [...submission.photo_file_ids, photoId];
         await saveSubmission(submission);
-        if (message.media_group_id) {
-          bufferMediaGroup(message.media_group_id, photoId, userId, targetChatId, { updateId });
+        const count = submission.photo_file_ids.length;
+        if (count === 1 || count % PHOTO_ACK_EVERY === 0) {
+          await sendMessage(userId, `Фото ${count} принято. Ещё?`, PHOTO_ACTIONS_KEYBOARD);
         }
       }
       return;
     }
 
-    await sendMessage(userId, "Ожидаю фото или кнопку Готово ✅.");
+    await sendMessage(userId, "Ожидаю фото или кнопку «✅ Готово, отправить».");
     return;
   }
 
@@ -492,6 +499,7 @@ serve(async (req) => {
     return new Response("Method not allowed", { status: 405 });
   }
 
+  const startTime = performance.now();
   try {
     const update = (await req.json()) as TelegramUpdate;
     console.log(
@@ -501,6 +509,7 @@ serve(async (req) => {
         from_id: update.message?.from?.id,
         media_group_id: update.message?.media_group_id,
         photo_count: update.message?.photo?.length ?? 0,
+        has_text: Boolean(update.message?.text),
       }),
     );
 
@@ -515,6 +524,9 @@ serve(async (req) => {
   } catch (error) {
     console.error("Handler error", error);
     await notifyAdminError(error);
+  } finally {
+    const durationMs = Math.round(performance.now() - startTime);
+    console.log("requestComplete", JSON.stringify({ duration_ms: durationMs }));
   }
 
   return new Response("ok", { status: 200 });
