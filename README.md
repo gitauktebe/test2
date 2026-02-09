@@ -9,6 +9,7 @@ Telegram-бот для сбора фото и пересылки в целеву
 - `supabase/migrations/0001_bot_state.sql` — старая таблица состояния (история).
 - `supabase/migrations/0002_tg_updates.sql` — таблица дедупликации обновлений.
 - `supabase/migrations/0003_bot_submissions_v2.sql` — текущая таблица заявок.
+- `supabase/migrations/0005_bot_submissions_schema.sql` — актуализация схемы под tg-webhook.
 
 ## Переменные окружения
 
