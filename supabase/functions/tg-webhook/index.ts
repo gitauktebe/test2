@@ -14,6 +14,7 @@ type Submission = {
   stage: string | null;
   phase: string | null;
   photo_file_ids: string[];
+  photo_unique_ids: string[];
   status: string;
   attempts: number;
   next_retry_at: string | null;
@@ -25,7 +26,7 @@ type TelegramMessage = {
   chat: { id: number; type: string };
   from?: { id: number; first_name?: string; last_name?: string; username?: string };
   text?: string;
-  photo?: Array<{ file_id: string; file_size?: number }>;
+  photo?: Array<{ file_id: string; file_unique_id?: string; file_size?: number }>;
   media_group_id?: string;
 };
 
@@ -62,7 +63,6 @@ const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 
 const RECOMMENDED_PHOTOS = 25;
-const PHOTO_ACK_EVERY = 5;
 
 function getEnv(name: string): string {
   const value = Deno.env.get(name);
@@ -117,7 +117,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
   const { data, error } = await supabase
     .from("bot_submissions")
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,status,attempts,next_retry_at,last_error",
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,next_retry_at,last_error",
     )
     .eq("user_id", userId)
     .in("status", ["collecting", "pending_send", "sending"])
@@ -146,6 +146,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     stage: (data.stage as string | null) ?? null,
     phase: (data.phase as string | null) ?? null,
     photo_file_ids: (data.photo_file_ids as string[]) ?? [],
+    photo_unique_ids: (data.photo_unique_ids as string[]) ?? (data.photo_file_ids as string[]) ?? [],
     status: data.status as string,
     attempts: (data.attempts as number) ?? 0,
     next_retry_at: (data.next_retry_at as string | null) ?? null,
@@ -161,9 +162,10 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
       chat_id: chatId,
       status: "collecting",
       photo_file_ids: [],
+      photo_unique_ids: [],
     })
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,status,attempts,next_retry_at,last_error",
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,next_retry_at,last_error",
     )
     .single();
 
@@ -184,6 +186,7 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
     stage: (data.stage as string | null) ?? null,
     phase: (data.phase as string | null) ?? null,
     photo_file_ids: (data.photo_file_ids as string[]) ?? [],
+    photo_unique_ids: (data.photo_unique_ids as string[]) ?? [],
     status: data.status as string,
     attempts: (data.attempts as number) ?? 0,
     next_retry_at: (data.next_retry_at as string | null) ?? null,
@@ -203,6 +206,7 @@ async function updateSubmission(submission: Submission) {
       stage: submission.stage,
       phase: submission.phase,
       photo_file_ids: submission.photo_file_ids,
+      photo_unique_ids: submission.photo_unique_ids,
       status: submission.status,
       attempts: submission.attempts,
       next_retry_at: submission.next_retry_at,
@@ -230,10 +234,16 @@ function isValidDate(text: string) {
   return /^\d{2}\.\d{2}\.\d{2,4}$/.test(text.trim());
 }
 
-function pickLargestPhotoId(photos: Array<{ file_id: string; file_size?: number }>) {
+function pickLargestPhoto(
+  photos: Array<{ file_id: string; file_unique_id?: string; file_size?: number }>,
+) {
   if (!photos.length) return null;
   const sorted = [...photos].sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0));
-  return sorted[sorted.length - 1].file_id;
+  return sorted[sorted.length - 1];
+}
+
+function getPhotoDedupKey(photo: { file_id: string; file_unique_id?: string }) {
+  return photo.file_unique_id ?? photo.file_id;
 }
 
 async function notifyAdminError(error: unknown) {
@@ -243,6 +253,58 @@ async function notifyAdminError(error: unknown) {
   } catch (sendError) {
     console.error("Failed to notify admin", sendError);
   }
+}
+
+async function handleIncomingPhoto(submission: Submission, message: TelegramMessage, userId: number) {
+  if (!message.photo || message.photo.length === 0) {
+    return false;
+  }
+
+  const photo = pickLargestPhoto(message.photo);
+  if (!photo) {
+    return false;
+  }
+
+  const dedupeKey = getPhotoDedupKey(photo);
+  const alreadySeen =
+    submission.photo_unique_ids.includes(dedupeKey) || submission.photo_file_ids.includes(photo.file_id);
+
+  if (alreadySeen) {
+    console.log(
+      "duplicate_photo_skipped",
+      JSON.stringify({
+        chat_id: message.chat.id,
+        from_id: userId,
+        message_id: message.message_id,
+        media_group_id: message.media_group_id ?? null,
+        file_id: photo.file_id,
+        file_unique_id: photo.file_unique_id ?? null,
+        total_photos_in_session: submission.photo_file_ids.length,
+      }),
+    );
+    return true;
+  }
+
+  submission.photo_file_ids = [...submission.photo_file_ids, photo.file_id];
+  submission.photo_unique_ids = [...submission.photo_unique_ids, dedupeKey];
+  await updateSubmission(submission);
+
+  const count = submission.photo_file_ids.length;
+  console.log(
+    "accepted_photo",
+    JSON.stringify({
+      chat_id: message.chat.id,
+      from_id: userId,
+      message_id: message.message_id,
+      media_group_id: message.media_group_id ?? null,
+      file_id: photo.file_id,
+      file_unique_id: photo.file_unique_id ?? null,
+      total_photos_in_session: count,
+    }),
+  );
+
+  await sendMessage(userId, `Фото принято: ${count}`, PHOTO_ACTIONS_KEYBOARD);
+  return true;
 }
 
 async function handleMessage(message: TelegramMessage, updateId: number) {
@@ -465,16 +527,7 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
       return;
     }
 
-    if (message.photo && message.photo.length > 0) {
-      const photoId = pickLargestPhotoId(message.photo);
-      if (photoId) {
-        submission.photo_file_ids = [...submission.photo_file_ids, photoId];
-        await updateSubmission(submission);
-        const count = submission.photo_file_ids.length;
-        if (count === 1 || count % PHOTO_ACK_EVERY === 0) {
-          await sendMessage(userId, `Фото ${count} принято. Ещё?`, PHOTO_ACTIONS_KEYBOARD);
-        }
-      }
+    if (await handleIncomingPhoto(submission, message, userId)) {
       return;
     }
 
@@ -482,17 +535,8 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (message.photo && message.photo.length > 0) {
-    const photoId = pickLargestPhotoId(message.photo);
-    if (photoId) {
-      submission.photo_file_ids = [...submission.photo_file_ids, photoId];
-      await updateSubmission(submission);
-      const count = submission.photo_file_ids.length;
-      if (count === 1 || count % PHOTO_ACK_EVERY === 0) {
-        await sendMessage(userId, `Фото ${count} принято. Ещё?`, PHOTO_ACTIONS_KEYBOARD);
-      }
-      return;
-    }
+  if (await handleIncomingPhoto(submission, message, userId)) {
+    return;
   }
 
   await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
