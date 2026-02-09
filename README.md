@@ -19,7 +19,7 @@ Telegram-бот для сбора фото и пересылки в целеву
 ## Деплой функции
 
 ```bash
-supabase functions deploy tg-webhook
+supabase functions deploy tg-webhook --no-verify-jwt
 supabase secrets set \
   SUPABASE_URL=... \
   SUPABASE_SERVICE_ROLE_KEY=... \
@@ -42,6 +42,14 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   -H "Content-Type: application/json" \
   -d '{"url":"https://<PROJECT_REF>.functions.supabase.co/tg-webhook"}'
 ```
+
+## Проверка webhook
+
+```bash
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
+```
+
+После деплоя `tg-webhook` поле `last_error_message` с `401 Unauthorized` должно исчезнуть.
 
 ## Команды
 

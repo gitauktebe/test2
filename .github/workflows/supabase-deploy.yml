@@ -24,4 +24,4 @@ jobs:
           version: latest
 
       - name: Deploy Supabase Edge Functions
-        run: supabase functions deploy --project-ref "$SUPABASE_PROJECT_REF"
+        run: supabase functions deploy --project-ref "$SUPABASE_PROJECT_REF" --no-verify-jwt
