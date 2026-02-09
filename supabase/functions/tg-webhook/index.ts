@@ -64,6 +64,28 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 const botToken = getEnv("TELEGRAM_BOT_TOKEN");
 const targetChatId = getEnv("TG_TARGET_CHAT_ID");
 
+const MEDIA_GROUP_FLUSH_MIN_MS = 1500;
+const MEDIA_GROUP_FLUSH_MAX_MS = 2000;
+const MEDIA_GROUP_CHUNK_DELAY_MIN_MS = 200;
+const MEDIA_GROUP_CHUNK_DELAY_MAX_MS = 400;
+
+type MediaGroupBuffer = {
+  chatId: number | string;
+  userId: number;
+  fileIds: string[];
+  timerId?: number;
+};
+
+const mediaGroupBuffers = new Map<string, MediaGroupBuffer>();
+
+function randomBetween(minMs: number, maxMs: number) {
+  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function callTelegram(method: string, body: Record<string, unknown>) {
   const response = await fetch(`${TELEGRAM_API}/bot${botToken}/${method}`, {
     method: "POST",
@@ -87,16 +109,44 @@ async function sendMessage(chatId: number | string, text: string, replyMarkup?: 
   });
 }
 
-async function sendMediaGroup(chatId: number | string, fileIds: string[]) {
+async function sendMediaGroup(
+  chatId: number | string,
+  fileIds: string[],
+  logContext?: { updateId?: number; mediaGroupId?: string },
+) {
   const chunks: string[][] = [];
   for (let i = 0; i < fileIds.length; i += 10) {
     chunks.push(fileIds.slice(i, i + 10));
   }
 
-  for (const chunk of chunks) {
+  console.log(
+    "sendMediaGroup",
+    JSON.stringify({
+      update_id: logContext?.updateId,
+      media_group_id: logContext?.mediaGroupId,
+      total_photos: fileIds.length,
+      chunk_count: chunks.length,
+    }),
+  );
+
+  for (const [index, chunk] of chunks.entries()) {
     const media = chunk.map((fileId) => ({ type: "photo", media: fileId }));
     await callTelegram("sendMediaGroup", { chat_id: chatId, media });
+    if (index < chunks.length - 1) {
+      await delay(randomBetween(MEDIA_GROUP_CHUNK_DELAY_MIN_MS, MEDIA_GROUP_CHUNK_DELAY_MAX_MS));
+    }
   }
+}
+
+async function dedupeUpdate(updateId: number) {
+  const { error } = await supabase.from("tg_updates").insert({ update_id: updateId });
+  if (error) {
+    if (error.code === "23505") {
+      return true;
+    }
+    throw new Error(`Failed to insert update_id: ${error.message}`);
+  }
+  return false;
 }
 
 async function getSubmission(userId: number): Promise<Submission> {
@@ -167,7 +217,65 @@ function pickLargestPhotoId(photos: Array<{ file_id: string; file_size?: number 
   return sorted[sorted.length - 1].file_id;
 }
 
-async function handleMessage(message: TelegramMessage) {
+async function notifyAdminError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    await sendMessage(targetChatId, `Ошибка обработки: ${message}`);
+  } catch (sendError) {
+    console.error("Failed to notify admin", sendError);
+  }
+}
+
+async function flushMediaGroup(mediaGroupId: string, logContext?: { updateId?: number }) {
+  const buffer = mediaGroupBuffers.get(mediaGroupId);
+  if (!buffer) return;
+  mediaGroupBuffers.delete(mediaGroupId);
+  console.log(
+    "flushMediaGroup",
+    JSON.stringify({
+      update_id: logContext?.updateId,
+      media_group_id: mediaGroupId,
+      user_id: buffer.userId,
+      photo_count: buffer.fileIds.length,
+    }),
+  );
+  await sendMediaGroup(buffer.chatId, buffer.fileIds, {
+    updateId: logContext?.updateId,
+    mediaGroupId,
+  });
+}
+
+function bufferMediaGroup(
+  mediaGroupId: string,
+  fileId: string,
+  userId: number,
+  chatId: number | string,
+  logContext?: { updateId?: number },
+) {
+  const existing = mediaGroupBuffers.get(mediaGroupId);
+  const buffer: MediaGroupBuffer = existing ?? { chatId, userId, fileIds: [] };
+  buffer.fileIds.push(fileId);
+  if (buffer.timerId) {
+    clearTimeout(buffer.timerId);
+  }
+  buffer.timerId = setTimeout(() => {
+    flushMediaGroup(mediaGroupId, logContext).catch((error) => {
+      console.error("Failed to flush media group", error);
+    });
+  }, randomBetween(MEDIA_GROUP_FLUSH_MIN_MS, MEDIA_GROUP_FLUSH_MAX_MS));
+  mediaGroupBuffers.set(mediaGroupId, buffer);
+  console.log(
+    "bufferMediaGroup",
+    JSON.stringify({
+      update_id: logContext?.updateId,
+      media_group_id: mediaGroupId,
+      user_id: userId,
+      buffered_count: buffer.fileIds.length,
+    }),
+  );
+}
+
+async function handleMessage(message: TelegramMessage, updateId: number) {
   if (message.chat.type !== "private") {
     return;
   }
@@ -365,6 +473,9 @@ async function handleMessage(message: TelegramMessage) {
       if (photoId) {
         submission.photo_file_ids = [...submission.photo_file_ids, photoId];
         await saveSubmission(submission);
+        if (message.media_group_id) {
+          bufferMediaGroup(message.media_group_id, photoId, userId, targetChatId, { updateId });
+        }
       }
       return;
     }
@@ -381,15 +492,29 @@ serve(async (req) => {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const update = (await req.json()) as TelegramUpdate;
-
   try {
+    const update = (await req.json()) as TelegramUpdate;
+    console.log(
+      "incomingUpdate",
+      JSON.stringify({
+        update_id: update.update_id,
+        from_id: update.message?.from?.id,
+        media_group_id: update.message?.media_group_id,
+        photo_count: update.message?.photo?.length ?? 0,
+      }),
+    );
+
+    if (await dedupeUpdate(update.update_id)) {
+      console.log("duplicateUpdate", JSON.stringify({ update_id: update.update_id }));
+      return new Response("ok", { status: 200 });
+    }
+
     if (update.message) {
-      await handleMessage(update.message);
+      await handleMessage(update.message, update.update_id);
     }
   } catch (error) {
     console.error("Handler error", error);
-    return new Response("Error", { status: 500 });
+    await notifyAdminError(error);
   }
 
   return new Response("ok", { status: 200 });
