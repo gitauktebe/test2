@@ -219,6 +219,29 @@ async function updateSubmission(submission: Submission) {
   }
 }
 
+async function appendSubmissionPhoto(submissionId: string, fileId: string, uniqueId: string) {
+  const { data, error } = await supabase
+    .rpc("append_submission_photo", {
+      p_submission_id: submissionId,
+      p_file_id: fileId,
+      p_unique_id: uniqueId,
+    })
+    .single();
+
+  if (error) {
+    throw new Error(`Failed to append photo: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new Error("Failed to append photo: submission not found");
+  }
+
+  return {
+    photoCount: (data.photo_count as number) ?? 0,
+    added: (data.added as boolean) ?? false,
+  };
+}
+
 function getSubmissionStep(submission: Submission) {
   if (!submission.event_date) return "await_date";
   if (!submission.event_type) return "await_type";
@@ -266,10 +289,9 @@ async function handleIncomingPhoto(submission: Submission, message: TelegramMess
   }
 
   const dedupeKey = getPhotoDedupKey(photo);
-  const alreadySeen =
-    submission.photo_unique_ids.includes(dedupeKey) || submission.photo_file_ids.includes(photo.file_id);
+  const { photoCount, added } = await appendSubmissionPhoto(submission.id, photo.file_id, dedupeKey);
 
-  if (alreadySeen) {
+  if (!added) {
     console.log(
       "duplicate_photo_skipped",
       JSON.stringify({
@@ -279,17 +301,13 @@ async function handleIncomingPhoto(submission: Submission, message: TelegramMess
         media_group_id: message.media_group_id ?? null,
         file_id: photo.file_id,
         file_unique_id: photo.file_unique_id ?? null,
-        total_photos_in_session: submission.photo_file_ids.length,
+        total_photos_in_session: photoCount,
       }),
     );
     return true;
   }
 
-  submission.photo_file_ids = [...submission.photo_file_ids, photo.file_id];
-  submission.photo_unique_ids = [...submission.photo_unique_ids, dedupeKey];
-  await updateSubmission(submission);
-
-  const count = submission.photo_file_ids.length;
+  const count = photoCount;
   console.log(
     "accepted_photo",
     JSON.stringify({
