@@ -34,6 +34,8 @@ supabase secrets set \
 supabase db push
 ```
 
+После деплоя выполнить миграции (при необходимости через SQL Editor в Supabase).
+
 ## Установка webhook
 
 Замените `<PROJECT_REF>` на ref вашего проекта Supabase.
