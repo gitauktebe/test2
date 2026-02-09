@@ -5,27 +5,32 @@ Telegram-бот для сбора фото и пересылки в целеву
 ## Структура
 
 - `supabase/functions/tg-webhook/index.ts` — webhook-обработчик Telegram.
-- `supabase/migrations/0001_bot_state.sql` — таблица состояния.
+- `supabase/functions/tg-worker/index.ts` — worker для отправки накопленных фото.
+- `supabase/migrations/0001_bot_state.sql` — старая таблица состояния (история).
 - `supabase/migrations/0002_tg_updates.sql` — таблица дедупликации обновлений.
+- `supabase/migrations/0003_bot_submissions_v2.sql` — текущая таблица заявок.
 
 ## Переменные окружения
 
-В Supabase Edge Function должны быть заданы:
+В Supabase Edge Functions должны быть заданы:
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TG_TARGET_CHAT_ID`
+- `TG_WORKER_BATCH_LIMIT` (необязательно, количество заявок за один запуск worker)
 
-## Деплой функции
+## Деплой функций
 
 ```bash
 supabase functions deploy tg-webhook --no-verify-jwt
+supabase functions deploy tg-worker --no-verify-jwt
 supabase secrets set \
   SUPABASE_URL=... \
   SUPABASE_SERVICE_ROLE_KEY=... \
   TELEGRAM_BOT_TOKEN=... \
-  TG_TARGET_CHAT_ID=...
+  TG_TARGET_CHAT_ID=... \
+  TG_WORKER_BATCH_LIMIT=5
 ```
 
 Применить миграцию:
@@ -54,13 +59,28 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 
 После деплоя `tg-webhook` поле `last_error_message` с `401 Unauthorized` должно исчезнуть.
 
+## Запуск worker вручную
+
+```bash
+curl -X POST "https://<PROJECT_REF>.functions.supabase.co/tg-worker"
+```
+
+## Как проверить работу
+
+1. Откройте диалог с ботом, выполните `/start`, нажмите "Отправить фото" и дойдите до шага отправки фото.
+2. Отправьте 5–30 фото (можно альбомом).
+3. Нажмите "Готово ✅". Бот ответит «Отправляю…».
+4. Запустите `tg-worker` (или дождитесь запланированного запуска) и убедитесь, что фото появились в целевом чате.
+5. Проверьте, что пользователь получил финальное сообщение «Фото доставлены, спасибо».
+
+## Как посмотреть логи
+
+```bash
+supabase functions logs tg-webhook
+supabase functions logs tg-worker
+```
+
 ## Команды
 
 - `/start` — начать диалог.
 - `/cancel` — сбросить текущий черновик.
-
-## Минимальный тест (альбом 14 фото)
-
-1. Откройте диалог с ботом, выполните `/start`, выберите "Отправить фото" и дойдите до шага отправки фото.
-2. В Telegram выделите 14 фотографий и отправьте их одним альбомом (media group).
-3. Проверьте целевой чат: бот должен отправить 2 чанка (10 + 4) без ошибок 500 в логах webhook.
