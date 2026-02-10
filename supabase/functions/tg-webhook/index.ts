@@ -17,7 +17,6 @@ type Submission = {
   photo_unique_ids: string[];
   status: string;
   attempts: number;
-  next_retry_at: string | null;
   last_error: string | null;
 };
 
@@ -45,6 +44,11 @@ const START_KEYBOARD = {
 
 const PHOTO_ACTIONS_KEYBOARD = {
   keyboard: [[{ text: "Готово ✅" }, { text: "Отмена" }]],
+  resize_keyboard: true,
+};
+
+const RETRY_ACTIONS_KEYBOARD = {
+  keyboard: [[{ text: "Повторить отправку" }, { text: "Отмена" }]],
   resize_keyboard: true,
 };
 
@@ -91,7 +95,12 @@ async function callTelegram(method: string, body: Record<string, unknown>) {
     throw new Error(`Telegram API error (${method}): ${errorText}`);
   }
 
-  return response.json();
+  const payload = await response.json();
+  if (!payload?.ok) {
+    throw new Error(`Telegram API error (${method}): ${JSON.stringify(payload)}`);
+  }
+
+  return payload;
 }
 
 async function sendMessage(chatId: number | string, text: string, replyMarkup?: unknown) {
@@ -117,10 +126,10 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
   const { data, error } = await supabase
     .from("bot_submissions")
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,next_retry_at,last_error",
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,last_error",
     )
     .eq("user_id", userId)
-    .in("status", ["collecting", "pending_send", "sending"])
+    .in("status", ["collecting", "failed"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -149,7 +158,6 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     photo_unique_ids: (data.photo_unique_ids as string[]) ?? (data.photo_file_ids as string[]) ?? [],
     status: data.status as string,
     attempts: (data.attempts as number) ?? 0,
-    next_retry_at: (data.next_retry_at as string | null) ?? null,
     last_error: (data.last_error as string | null) ?? null,
   };
 }
@@ -165,7 +173,7 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
       photo_unique_ids: [],
     })
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,next_retry_at,last_error",
+      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,last_error",
     )
     .single();
 
@@ -189,7 +197,6 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
     photo_unique_ids: (data.photo_unique_ids as string[]) ?? [],
     status: data.status as string,
     attempts: (data.attempts as number) ?? 0,
-    next_retry_at: (data.next_retry_at as string | null) ?? null,
     last_error: (data.last_error as string | null) ?? null,
   };
 }
@@ -209,7 +216,6 @@ async function updateSubmission(submission: Submission) {
       photo_unique_ids: submission.photo_unique_ids,
       status: submission.status,
       attempts: submission.attempts,
-      next_retry_at: submission.next_retry_at,
       last_error: submission.last_error,
     })
     .eq("id", submission.id);
@@ -217,6 +223,73 @@ async function updateSubmission(submission: Submission) {
   if (error) {
     throw new Error(`Failed to save submission: ${error.message}`);
   }
+}
+
+function buildSubmissionHeader(submission: Submission) {
+  const eventType =
+    submission.event_type === "Свой вариант" ? submission.custom_event_type ?? "" : submission.event_type ?? "";
+
+  return [
+    "[",
+    submission.event_date ?? "",
+    eventType,
+    submission.sport ?? "",
+    submission.gender ?? "",
+    submission.stage ?? "",
+    submission.phase ?? "",
+    "]",
+    "",
+  ].join("\n");
+}
+
+function chunkArray<T>(items: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function sendSubmissionToTarget(submission: Submission) {
+  const header = buildSubmissionHeader(submission);
+  const photos = submission.photo_file_ids;
+  const batches = chunkArray(photos, 10);
+
+  console.log(
+    "submission_delivery_start",
+    JSON.stringify({
+      submission_id: submission.id,
+      photo_count: photos.length,
+      target_chat_id: targetChatId,
+      batch_count: batches.length,
+    }),
+  );
+
+  const results: unknown[] = [];
+  const headerResult = await callTelegram("sendMessage", {
+    chat_id: targetChatId,
+    text: header,
+  });
+  results.push({ method: "sendMessage", result: headerResult });
+
+  for (let i = 0; i < batches.length; i += 1) {
+    const media = batches[i].map((fileId) => ({ type: "photo", media: fileId }));
+    const batchResult = await callTelegram("sendMediaGroup", {
+      chat_id: targetChatId,
+      media,
+    });
+    results.push({ method: "sendMediaGroup", batch_index: i, result: batchResult });
+  }
+
+  console.log(
+    "submission_delivery_success",
+    JSON.stringify({
+      submission_id: submission.id,
+      photo_count: photos.length,
+      target_chat_id: targetChatId,
+      telegram_results: results,
+    }),
+  );
 }
 
 type AppendPhotoResult = {
@@ -346,7 +419,7 @@ async function handleIncomingPhoto(submission: Submission, message: TelegramMess
   return true;
 }
 
-async function handleMessage(message: TelegramMessage, updateId: number) {
+async function handleMessage(message: TelegramMessage) {
   if (message.chat.type !== "private") {
     return;
   }
@@ -391,10 +464,6 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
   }
 
   if (text === "Отправить фото") {
-    if (submission && submission.status !== "collecting") {
-      await sendMessage(userId, "Подборка уже отправляется. Пожалуйста, подождите.", PHOTO_ACTIONS_KEYBOARD);
-      return;
-    }
     if (submission && submission.status === "collecting") {
       submission.status = "failed";
       submission.last_error = "restart_by_user";
@@ -410,8 +479,55 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
     return;
   }
 
-  if (submission.status === "pending_send" || submission.status === "sending") {
-    await sendMessage(userId, "Подборка уже отправляется. Пожалуйста, подождите.", PHOTO_ACTIONS_KEYBOARD);
+  if (submission.status === "failed") {
+    if (text === "Повторить отправку") {
+      if (submission.photo_file_ids.length === 0) {
+        await sendMessage(userId, "Не вижу фото для отправки. Пришлите фото и нажмите «Готово ✅».", PHOTO_ACTIONS_KEYBOARD);
+        submission.status = "collecting";
+        await updateSubmission(submission);
+        return;
+      }
+
+      try {
+        await sendSubmissionToTarget(submission);
+        submission.status = "sent";
+        submission.last_error = null;
+        await updateSubmission(submission);
+        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        submission.attempts += 1;
+        submission.last_error = errorMessage;
+        await updateSubmission(submission);
+        console.error(
+          "submission_delivery_error",
+          JSON.stringify({
+            submission_id: submission.id,
+            photo_count: submission.photo_file_ids.length,
+            target_chat_id: targetChatId,
+            error: errorMessage,
+          }),
+        );
+        await sendMessage(
+          userId,
+          "Не удалось доставить фото в группу. Проверьте и нажмите «Повторить отправку», либо отмените заявку.",
+          RETRY_ACTIONS_KEYBOARD,
+        );
+      }
+      return;
+    }
+
+    if (await handleIncomingPhoto(submission, message, userId)) {
+      submission.status = "collecting";
+      await updateSubmission(submission);
+      return;
+    }
+
+    await sendMessage(
+      userId,
+      "Последняя отправка не удалась. Нажмите «Повторить отправку» или «Отмена».",
+      RETRY_ACTIONS_KEYBOARD,
+    );
     return;
   }
 
@@ -550,19 +666,33 @@ async function handleMessage(message: TelegramMessage, updateId: number) {
         return;
       }
 
-      submission.status = "pending_send";
-      submission.next_retry_at = null;
-      await updateSubmission(submission);
-      console.log(
-        "submissionSending",
-        JSON.stringify({
-          update_id: updateId,
-          user_id: userId,
-          photo_count: submission.photo_file_ids.length,
-        }),
-      );
-
-      await sendMessage(userId, "Отправляю…");
+      try {
+        await sendSubmissionToTarget(submission);
+        submission.status = "sent";
+        submission.last_error = null;
+        await updateSubmission(submission);
+        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        submission.status = "failed";
+        submission.attempts += 1;
+        submission.last_error = errorMessage;
+        await updateSubmission(submission);
+        console.error(
+          "submission_delivery_error",
+          JSON.stringify({
+            submission_id: submission.id,
+            photo_count: submission.photo_file_ids.length,
+            target_chat_id: targetChatId,
+            error: errorMessage,
+          }),
+        );
+        await sendMessage(
+          userId,
+          "Не удалось доставить фото в группу. Нажмите «Повторить отправку» или «Отмена».",
+          RETRY_ACTIONS_KEYBOARD,
+        );
+      }
       return;
     }
 
@@ -606,7 +736,7 @@ serve(async (req) => {
     }
 
     if (update.message) {
-      await handleMessage(update.message, update.update_id);
+      await handleMessage(update.message);
     }
   } catch (error) {
     console.error("Handler error", error);
