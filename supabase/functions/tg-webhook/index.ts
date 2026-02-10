@@ -6,6 +6,7 @@ type Submission = {
   user_id: number;
   chat_id: number;
   created_at: string;
+  kind: string;
   event_date: string | null;
   event_type: string | null;
   custom_event_type: string | null;
@@ -13,6 +14,7 @@ type Submission = {
   gender: string | null;
   stage: string | null;
   phase: string | null;
+  achievement_text: string | null;
   photo_file_ids: string[];
   photo_unique_ids: string[];
   status: string;
@@ -37,9 +39,8 @@ type TelegramUpdate = {
 const TELEGRAM_API = "https://api.telegram.org";
 
 const START_KEYBOARD = {
-  keyboard: [[{ text: "Отправить фото" }]],
+  keyboard: [[{ text: "🏆 Соревнования ШСК" }], [{ text: "🌟 Достижения детей" }]],
   resize_keyboard: true,
-  one_time_keyboard: true,
 };
 
 const PHOTO_ACTIONS_KEYBOARD = {
@@ -72,6 +73,7 @@ const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 
 const RECOMMENDED_PHOTOS = 25;
+const MAX_ACHIEVEMENT_TEXT_LENGTH = 700;
 
 function getEnv(name: string): string {
   const value = Deno.env.get(name);
@@ -131,7 +133,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
   const { data, error } = await supabase
     .from("bot_submissions")
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,last_error",
+      "id,user_id,chat_id,created_at,kind,event_date,event_type,custom_event_type,sport,gender,stage,phase,achievement_text,photo_file_ids,photo_unique_ids,status,attempts,last_error",
     )
     .eq("user_id", userId)
     .in("status", ["collecting", "confirming", "failed"])
@@ -152,6 +154,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     user_id: data.user_id as number,
     chat_id: data.chat_id as number,
     created_at: data.created_at as string,
+    kind: (data.kind as string) ?? "competition",
     event_date: (data.event_date as string | null) ?? null,
     event_type: (data.event_type as string | null) ?? null,
     custom_event_type: (data.custom_event_type as string | null) ?? null,
@@ -159,6 +162,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     gender: (data.gender as string | null) ?? null,
     stage: (data.stage as string | null) ?? null,
     phase: (data.phase as string | null) ?? null,
+    achievement_text: (data.achievement_text as string | null) ?? null,
     photo_file_ids: (data.photo_file_ids as string[]) ?? [],
     photo_unique_ids: (data.photo_unique_ids as string[]) ?? (data.photo_file_ids as string[]) ?? [],
     status: data.status as string,
@@ -167,18 +171,19 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
   };
 }
 
-async function createSubmission(userId: number, chatId: number): Promise<Submission> {
+async function createSubmission(userId: number, chatId: number, kind: "competition" | "achievement"): Promise<Submission> {
   const { data, error } = await supabase
     .from("bot_submissions")
     .insert({
       user_id: userId,
       chat_id: chatId,
+      kind,
       status: "collecting",
       photo_file_ids: [],
       photo_unique_ids: [],
     })
     .select(
-      "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,last_error",
+      "id,user_id,chat_id,created_at,kind,event_date,event_type,custom_event_type,sport,gender,stage,phase,achievement_text,photo_file_ids,photo_unique_ids,status,attempts,last_error",
     )
     .single();
 
@@ -191,6 +196,7 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
     user_id: data.user_id as number,
     chat_id: data.chat_id as number,
     created_at: data.created_at as string,
+    kind: (data.kind as string) ?? "competition",
     event_date: (data.event_date as string | null) ?? null,
     event_type: (data.event_type as string | null) ?? null,
     custom_event_type: (data.custom_event_type as string | null) ?? null,
@@ -198,6 +204,7 @@ async function createSubmission(userId: number, chatId: number): Promise<Submiss
     gender: (data.gender as string | null) ?? null,
     stage: (data.stage as string | null) ?? null,
     phase: (data.phase as string | null) ?? null,
+    achievement_text: (data.achievement_text as string | null) ?? null,
     photo_file_ids: (data.photo_file_ids as string[]) ?? [],
     photo_unique_ids: (data.photo_unique_ids as string[]) ?? [],
     status: data.status as string,
@@ -217,6 +224,7 @@ async function updateSubmission(submission: Submission) {
       gender: submission.gender,
       stage: submission.stage,
       phase: submission.phase,
+      achievement_text: submission.achievement_text,
       photo_file_ids: submission.photo_file_ids,
       photo_unique_ids: submission.photo_unique_ids,
       status: submission.status,
@@ -231,6 +239,10 @@ async function updateSubmission(submission: Submission) {
 }
 
 function buildSubmissionHeader(submission: Submission) {
+  if (submission.kind === "achievement") {
+    return ["🌟 Достижения детей", submission.achievement_text ?? "", ""].join("\n");
+  }
+
   const eventType =
     submission.event_type === "Свой вариант" ? submission.custom_event_type ?? "" : submission.event_type ?? "";
 
@@ -337,6 +349,11 @@ async function appendSubmissionPhoto(
 }
 
 function getSubmissionStep(submission: Submission) {
+  if (submission.kind === "achievement") {
+    if (!submission.achievement_text) return "await_achievement_text";
+    return "await_photos";
+  }
+
   if (!submission.event_date) return "await_date";
   if (!submission.event_type) return "await_type";
   if (submission.event_type === "Свой вариант" && !submission.custom_event_type) return "await_custom_type";
@@ -443,7 +460,7 @@ async function handleMessage(message: TelegramMessage) {
       submission.last_error = "cancelled_by_user";
       await updateSubmission(submission);
     }
-    await sendMessage(userId, "Привет! Готов принять подборку.", START_KEYBOARD);
+    await sendMessage(userId, "Привет! Выберите, что хотите отправить.", START_KEYBOARD);
     return;
   }
 
@@ -453,7 +470,7 @@ async function handleMessage(message: TelegramMessage) {
       submission.last_error = "cancelled_by_user";
       await updateSubmission(submission);
     }
-    await sendMessage(userId, "Диалог сброшен. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
+    await sendMessage(userId, "Диалог сброшен. Чтобы начать заново, выберите сценарий ниже.", START_KEYBOARD);
     return;
   }
 
@@ -463,7 +480,7 @@ async function handleMessage(message: TelegramMessage) {
       submission.last_error = "cancelled_by_user";
       await updateSubmission(submission);
     }
-    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
+    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, выберите сценарий ниже.", START_KEYBOARD);
     return;
   }
 
@@ -473,23 +490,34 @@ async function handleMessage(message: TelegramMessage) {
       submission.last_error = "cancelled_by_user";
       await updateSubmission(submission);
     }
-    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
+    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, выберите сценарий ниже.", START_KEYBOARD);
     return;
   }
 
-  if (text === "Отправить фото") {
-    if (submission && submission.status === "collecting") {
+  if (text === "🏆 Соревнования ШСК") {
+    if (submission) {
       submission.status = "failed";
       submission.last_error = "restart_by_user";
       await updateSubmission(submission);
     }
-    await createSubmission(userId, chatId);
+    await createSubmission(userId, chatId, "competition");
     await sendMessage(userId, "Укажите дату (дд.мм.гг или дд.мм.гггг):");
     return;
   }
 
+  if (text === "🌟 Достижения детей") {
+    if (submission) {
+      submission.status = "failed";
+      submission.last_error = "restart_by_user";
+      await updateSubmission(submission);
+    }
+    await createSubmission(userId, chatId, "achievement");
+    await sendMessage(userId, "Опишите достижение детей (до 700 символов):");
+    return;
+  }
+
   if (!submission) {
-    await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
+    await sendMessage(userId, "Выберите сценарий на клавиатуре ниже, чтобы начать.", START_KEYBOARD);
     return;
   }
 
@@ -589,11 +617,36 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   if (submission.status !== "collecting") {
-    await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
+    await sendMessage(userId, "Выберите сценарий на клавиатуре ниже, чтобы начать.", START_KEYBOARD);
     return;
   }
 
   const step = getSubmissionStep(submission);
+
+
+  if (step === "await_achievement_text") {
+    if (!text) {
+      await sendMessage(userId, "Текст достижения не должен быть пустым. Попробуйте ещё раз:");
+      return;
+    }
+
+    if (text.length > MAX_ACHIEVEMENT_TEXT_LENGTH) {
+      await sendMessage(
+        userId,
+        `Текст слишком длинный (${text.length} символов). Пожалуйста, сократите до ${MAX_ACHIEVEMENT_TEXT_LENGTH} символов.`,
+      );
+      return;
+    }
+
+    submission.achievement_text = text;
+    await updateSubmission(submission);
+    await sendMessage(
+      userId,
+      `Рекомендуем минимум ${RECOMMENDED_PHOTOS} фото хорошего качества (можно меньше)`,
+      PHOTO_ACTIONS_KEYBOARD,
+    );
+    return;
+  }
 
   if (step === "await_date") {
     if (!text || !isValidDate(text)) {
@@ -745,7 +798,7 @@ async function handleMessage(message: TelegramMessage) {
     return;
   }
 
-  await sendMessage(userId, "Нажмите «Отправить фото», чтобы начать.", START_KEYBOARD);
+  await sendMessage(userId, "Выберите сценарий на клавиатуре ниже, чтобы начать.", START_KEYBOARD);
 }
 
 serve(async (req) => {
