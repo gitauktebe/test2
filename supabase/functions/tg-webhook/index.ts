@@ -52,6 +52,11 @@ const RETRY_ACTIONS_KEYBOARD = {
   resize_keyboard: true,
 };
 
+const CONFIRM_ACTIONS_KEYBOARD = {
+  keyboard: [[{ text: "➕ Добавить фото" }], [{ text: "✅ Отправить" }, { text: "❌ Отмена" }]],
+  resize_keyboard: true,
+};
+
 const TYPE_OPTIONS = ["ШСЛ", "ПСИ", "ПС", "Фестиваль", "Свой вариант"];
 const DISCIPLINE_OPTIONS = [
   "Волейбол",
@@ -129,7 +134,7 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
       "id,user_id,chat_id,created_at,event_date,event_type,custom_event_type,sport,gender,stage,phase,photo_file_ids,photo_unique_ids,status,attempts,last_error",
     )
     .eq("user_id", userId)
-    .in("status", ["collecting", "failed"])
+    .in("status", ["collecting", "confirming", "failed"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -415,7 +420,6 @@ async function handleIncomingPhoto(submission: Submission, message: TelegramMess
     }),
   );
 
-  await sendMessage(userId, `Фото принято: ${count}`, PHOTO_ACTIONS_KEYBOARD);
   return true;
 }
 
@@ -454,6 +458,16 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   if (text === "Отмена") {
+    if (submission) {
+      submission.status = "failed";
+      submission.last_error = "cancelled_by_user";
+      await updateSubmission(submission);
+    }
+    await sendMessage(userId, "Заявка отменена. Чтобы начать заново, нажмите кнопку ниже.", START_KEYBOARD);
+    return;
+  }
+
+  if (text === "❌ Отмена") {
     if (submission) {
       submission.status = "failed";
       submission.last_error = "cancelled_by_user";
@@ -528,6 +542,49 @@ async function handleMessage(message: TelegramMessage) {
       "Последняя отправка не удалась. Нажмите «Повторить отправку» или «Отмена».",
       RETRY_ACTIONS_KEYBOARD,
     );
+    return;
+  }
+
+  if (submission.status === "confirming") {
+    if (text === "➕ Добавить фото") {
+      submission.status = "collecting";
+      await updateSubmission(submission);
+      await sendMessage(userId, "Добавляйте фото и нажмите «Готово ✅», когда закончите.", PHOTO_ACTIONS_KEYBOARD);
+      return;
+    }
+
+    if (text === "✅ Отправить") {
+      try {
+        await sendSubmissionToTarget(submission);
+        submission.status = "sent";
+        submission.last_error = null;
+        await updateSubmission(submission);
+        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        submission.status = "failed";
+        submission.attempts += 1;
+        submission.last_error = errorMessage;
+        await updateSubmission(submission);
+        console.error(
+          "submission_delivery_error",
+          JSON.stringify({
+            submission_id: submission.id,
+            photo_count: submission.photo_file_ids.length,
+            target_chat_id: targetChatId,
+            error: errorMessage,
+          }),
+        );
+        await sendMessage(
+          userId,
+          "Не удалось доставить фото в группу. Нажмите «Повторить отправку» или «Отмена».",
+          RETRY_ACTIONS_KEYBOARD,
+        );
+      }
+      return;
+    }
+
+    await sendMessage(userId, "Выберите действие: добавить фото, отправить или отменить.", CONFIRM_ACTIONS_KEYBOARD);
     return;
   }
 
@@ -662,37 +719,17 @@ async function handleMessage(message: TelegramMessage) {
   if (step === "await_photos") {
     if (text === "Готово ✅") {
       if (submission.photo_file_ids.length === 0) {
-        await sendMessage(userId, "Пока нет фото. Отправьте изображения и нажмите «Готово ✅».");
+        await sendMessage(userId, "Пока нет фото. Отправьте изображения и нажмите «Готово ✅».", PHOTO_ACTIONS_KEYBOARD);
         return;
       }
 
-      try {
-        await sendSubmissionToTarget(submission);
-        submission.status = "sent";
-        submission.last_error = null;
-        await updateSubmission(submission);
-        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        submission.status = "failed";
-        submission.attempts += 1;
-        submission.last_error = errorMessage;
-        await updateSubmission(submission);
-        console.error(
-          "submission_delivery_error",
-          JSON.stringify({
-            submission_id: submission.id,
-            photo_count: submission.photo_file_ids.length,
-            target_chat_id: targetChatId,
-            error: errorMessage,
-          }),
-        );
-        await sendMessage(
-          userId,
-          "Не удалось доставить фото в группу. Нажмите «Повторить отправку» или «Отмена».",
-          RETRY_ACTIONS_KEYBOARD,
-        );
-      }
+      submission.status = "confirming";
+      await updateSubmission(submission);
+      await sendMessage(
+        userId,
+        `Принято фото: ${submission.photo_file_ids.length}. Что делаем?`,
+        CONFIRM_ACTIONS_KEYBOARD,
+      );
       return;
     }
 
