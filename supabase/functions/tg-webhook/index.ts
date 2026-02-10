@@ -64,6 +64,7 @@ const DISCIPLINE_OPTIONS = [
   "Баскетбол",
   "Футбол",
   "Футзал",
+  "Настольный теннис",
   "Шашки",
   "Шахматы",
   "Пропустить",
@@ -73,6 +74,7 @@ const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 
 const RECOMMENDED_PHOTOS = 25;
+const RECOMMENDED_PHOTOS_ACHIEVEMENT = 3;
 const MAX_ACHIEVEMENT_TEXT_LENGTH = 700;
 
 function getEnv(name: string): string {
@@ -642,7 +644,7 @@ async function handleMessage(message: TelegramMessage) {
     await updateSubmission(submission);
     await sendMessage(
       userId,
-      `Рекомендуем минимум ${RECOMMENDED_PHOTOS} фото хорошего качества (можно меньше)`,
+      `Рекомендуем минимум ${RECOMMENDED_PHOTOS_ACHIEVEMENT} фото хорошего качества (можно меньше)`,
       PHOTO_ACTIONS_KEYBOARD,
     );
     return;
