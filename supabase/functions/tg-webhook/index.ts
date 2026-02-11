@@ -72,6 +72,7 @@ const DISCIPLINE_OPTIONS = [
 const GENDER_OPTIONS = ["Девочки", "Мальчики"];
 const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
+const SPORT_SKIP_MARKER = "__SKIP__";
 
 const RECOMMENDED_PHOTOS = 25;
 const RECOMMENDED_PHOTOS_ACHIEVEMENT = 3;
@@ -248,17 +249,15 @@ function buildSubmissionHeader(submission: Submission) {
   const eventType =
     submission.event_type === "Свой вариант" ? submission.custom_event_type ?? "" : submission.event_type ?? "";
 
-  return [
-    "[",
-    submission.event_date ?? "",
-    eventType,
-    submission.sport ?? "",
-    submission.gender ?? "",
-    submission.stage ?? "",
-    submission.phase ?? "",
-    "]",
-    "",
-  ].join("\n");
+  const lines = ["[", submission.event_date ?? "", eventType];
+
+  if (submission.sport !== SPORT_SKIP_MARKER) {
+    lines.push(submission.sport ?? "");
+  }
+
+  lines.push(submission.gender ?? "", submission.stage ?? "", submission.phase ?? "", "]", "");
+
+  return lines.join("\n");
 }
 
 function chunkArray<T>(items: T[], size: number) {
@@ -359,7 +358,7 @@ function getSubmissionStep(submission: Submission) {
   if (!submission.event_date) return "await_date";
   if (!submission.event_type) return "await_type";
   if (submission.event_type === "Свой вариант" && !submission.custom_event_type) return "await_custom_type";
-  if (!submission.sport) return "await_sport";
+  if (submission.sport === null) return "await_sport";
   if (!submission.gender) return "await_gender";
   if (!submission.stage) return "await_stage";
   if (!submission.phase) return "await_phase";
@@ -713,7 +712,7 @@ async function handleMessage(message: TelegramMessage) {
       return;
     }
 
-    submission.sport = text === "Пропустить" ? null : text;
+    submission.sport = text === "Пропустить" ? SPORT_SKIP_MARKER : text;
     await updateSubmission(submission);
     await sendMessage(userId, "Выберите категорию:", {
       keyboard: GENDER_OPTIONS.map((option) => [{ text: option }]),
