@@ -60,14 +60,14 @@ const PHOTO_COLLECTION_KEYBOARD = {
 };
 
 const CONFIRM_ACTIONS_KEYBOARD = {
-  keyboard: [[{ text: "📤 Отправить в группу" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
+  keyboard: [[{ text: "📤 Отправить" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
   resize_keyboard: true,
   one_time_keyboard: false,
   is_persistent: true,
 };
 
 const RETRY_ACTIONS_KEYBOARD = {
-  keyboard: [[{ text: "📤 Отправить в группу" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
+  keyboard: [[{ text: "📤 Отправить" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
   resize_keyboard: true,
   one_time_keyboard: false,
   is_persistent: true,
@@ -730,7 +730,7 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   if (submission.status === "failed") {
-    if (text === "📤 Отправить в группу") {
+    if (text === "📤 Отправить") {
       if (submission.photo_file_ids.length === 0) {
         await sendPhotosCollectionPrompt(submission, chatId, 0);
         submission.status = "collecting";
@@ -772,7 +772,7 @@ async function handleMessage(message: TelegramMessage) {
       return;
     }
 
-    if (text === "📤 Отправить в группу") {
+    if (text === "📤 Отправить") {
       await sendSubmissionAndFinalize(submission, userId);
       return;
     }
