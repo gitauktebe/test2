@@ -84,7 +84,7 @@ const DISCIPLINE_OPTIONS = [
   "Шахматы",
   "Пропустить",
 ];
-const GENDER_OPTIONS = ["Девочки", "Мальчики"];
+const GENDER_OPTIONS = ["Девочки", "Мальчики", "Микс"];
 const STAGE_OPTIONS = ["Межрайон", "Москва"];
 const PHASE_OPTIONS = ["Группы", "Плейофф"];
 const SPORT_SKIP_MARKER = "__SKIP__";
@@ -304,13 +304,13 @@ function buildSubmissionHeader(submission: Submission) {
   const eventType =
     submission.event_type === "Свой вариант" ? submission.custom_event_type ?? "" : submission.event_type ?? "";
 
-  const lines = ["[", submission.event_date ?? "", eventType];
+  const lines = [submission.event_date ?? "", eventType];
 
   if (submission.sport !== SPORT_SKIP_MARKER) {
     lines.push(submission.sport ?? "");
   }
 
-  lines.push(submission.gender ?? "", submission.stage ?? "", submission.phase ?? "", "]", "");
+  lines.push(submission.gender ?? "", submission.stage ?? "", submission.phase ?? "", "");
 
   return lines.join("\n");
 }
@@ -888,7 +888,7 @@ async function handleMessage(message: TelegramMessage) {
 
   if (step === "await_gender") {
     if (!text || !GENDER_OPTIONS.includes(text)) {
-      await sendMessage(userId, "Пожалуйста, выберите из кнопок: Девочки или Мальчики.");
+      await sendMessage(userId, "Пожалуйста, выберите категорию из списка кнопок.");
       return;
     }
 
