@@ -52,9 +52,25 @@ const START_KEYBOARD = {
   resize_keyboard: true,
 };
 
-const RETRY_ACTIONS_KEYBOARD = {
-  keyboard: [[{ text: "Повторить отправку" }, { text: "Отмена" }]],
+const PHOTO_COLLECTION_KEYBOARD = {
+  keyboard: [[{ text: "✅ Готово" }], [{ text: "❌ Отмена" }]],
   resize_keyboard: true,
+  one_time_keyboard: false,
+  is_persistent: true,
+};
+
+const CONFIRM_ACTIONS_KEYBOARD = {
+  keyboard: [[{ text: "📤 Отправить в группу" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
+  resize_keyboard: true,
+  one_time_keyboard: false,
+  is_persistent: true,
+};
+
+const RETRY_ACTIONS_KEYBOARD = {
+  keyboard: [[{ text: "📤 Отправить в группу" }], [{ text: "➕ Добавить ещё фото" }], [{ text: "❌ Отмена" }]],
+  resize_keyboard: true,
+  one_time_keyboard: false,
+  is_persistent: true,
 };
 
 const TYPE_OPTIONS = ["ШСЛ", "ПСИ", "ПС", "Фестиваль", "Свой вариант"];
@@ -120,22 +136,6 @@ async function sendMessage(chatId: number | string, text: string, replyMarkup?: 
   });
 }
 
-function getPhotosInlineKeyboard(photoCount: number) {
-  return {
-    inline_keyboard: [[{ text: `✅ Готово (${photoCount})`, callback_data: "done" }, { text: "❌ Отмена", callback_data: "cancel" }]],
-  };
-}
-
-function getConfirmInlineKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: "📤 Отправить в группу", callback_data: "send" }],
-      [{ text: "➕ Добавить ещё", callback_data: "more" }],
-      [{ text: "❌ Отмена", callback_data: "cancel" }],
-    ],
-  };
-}
-
 async function answerCallbackQuery(callbackQueryId: string, text?: string) {
   await callTelegram("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
@@ -183,6 +183,26 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     return null;
   }
 
+  const normalizeStringArray = (value: unknown): string[] => {
+    if (Array.isArray(value)) {
+      return value.filter((item): item is string => typeof item === "string");
+    }
+
+    if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+      } catch {
+        return [];
+      }
+    }
+
+    return [];
+  };
+
+  const photoFileIds = normalizeStringArray(data.photo_file_ids);
+  const photoUniqueIds = normalizeStringArray(data.photo_unique_ids);
+
   return {
     id: data.id as string,
     user_id: data.user_id as number,
@@ -197,8 +217,8 @@ async function getActiveSubmission(userId: number): Promise<Submission | null> {
     stage: (data.stage as string | null) ?? null,
     phase: (data.phase as string | null) ?? null,
     achievement_text: (data.achievement_text as string | null) ?? null,
-    photo_file_ids: (data.photo_file_ids as string[]) ?? [],
-    photo_unique_ids: (data.photo_unique_ids as string[]) ?? (data.photo_file_ids as string[]) ?? [],
+    photo_file_ids: photoFileIds,
+    photo_unique_ids: photoUniqueIds.length > 0 ? photoUniqueIds : photoFileIds,
     status: data.status as string,
     attempts: (data.attempts as number) ?? 0,
     last_error: (data.last_error as string | null) ?? null,
@@ -303,7 +323,7 @@ function chunkArray<T>(items: T[], size: number) {
   return chunks;
 }
 
-async function sendSubmissionToTarget(submission: Submission) {
+async function sendSubmissionToGroup(submission: Submission) {
   const header = buildSubmissionHeader(submission);
   const photos = submission.photo_file_ids;
   const batches = chunkArray(photos, 10);
@@ -426,7 +446,7 @@ async function notifyAdminError(error: unknown) {
 }
 
 async function ensurePhotoPromptMessage(submission: Submission, chatId: number, text: string) {
-  const markup = getPhotosInlineKeyboard(submission.photo_file_ids.length);
+  const markup = PHOTO_COLLECTION_KEYBOARD;
   if (submission.photos_prompt_message_id) {
     try {
       await editMessageText(chatId, submission.photos_prompt_message_id, text, markup);
@@ -446,7 +466,7 @@ async function ensurePhotoPromptMessage(submission: Submission, chatId: number, 
 }
 
 async function ensureConfirmPromptMessage(submission: Submission, chatId: number, text: string) {
-  const markup = getConfirmInlineKeyboard();
+  const markup = CONFIRM_ACTIONS_KEYBOARD;
   if (submission.photos_prompt_message_id) {
     try {
       await editMessageText(chatId, submission.photos_prompt_message_id, text, markup);
@@ -529,9 +549,39 @@ async function handleIncomingPhoto(
 async function sendPhotosCollectionPrompt(submission: Submission, chatId: number, photoCount: number) {
   const text =
     photoCount > 0
-      ? `Получено фото: ${photoCount}. Когда закончите — нажмите ✅ Готово.`
-      : "Продолжайте отправлять фото. Когда закончите — нажмите ✅ Готово.";
+      ? `Отправляйте фото. Уже получено: ${photoCount}. Когда закончите, нажмите «✅ Готово».`
+      : "Отправляйте фото. Когда закончите, нажмите «✅ Готово».";
   await ensurePhotoPromptMessage(submission, chatId, text);
+}
+
+async function sendSubmissionAndFinalize(submission: Submission, chatId: number) {
+  submission.status = "sending";
+  await updateSubmission(submission);
+
+  try {
+    await sendSubmissionToGroup(submission);
+    submission.status = "sent";
+    submission.last_error = null;
+    submission.photos_prompt_message_id = null;
+    await updateSubmission(submission);
+    await sendMessage(chatId, "✅ Фото доставлены, спасибо!", START_KEYBOARD);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    submission.status = "failed";
+    submission.attempts += 1;
+    submission.last_error = errorMessage;
+    await updateSubmission(submission);
+    console.error(
+      "submission_delivery_error",
+      JSON.stringify({
+        submission_id: submission.id,
+        photo_count: submission.photo_file_ids.length,
+        target_chat_id: targetChatId,
+        error: errorMessage,
+      }),
+    );
+    await sendMessage(chatId, "Не удалось отправить фото, попробуйте ещё раз", RETRY_ACTIONS_KEYBOARD);
+  }
 }
 
 async function handleCallbackQuery(callbackQuery: TelegramCallbackQuery) {
@@ -579,49 +629,13 @@ async function handleCallbackQuery(callbackQuery: TelegramCallbackQuery) {
     submission.status = "confirming";
     await updateSubmission(submission);
     await answerCallbackQuery(callbackQuery.id);
-    await ensureConfirmPromptMessage(
-      submission,
-      chatId,
-      `Получено фото: ${submission.photo_file_ids.length}. Подтвердите отправку:`,
-    );
+    await sendMessage(chatId, `Получено фото: ${submission.photo_file_ids.length}. Что делаем дальше?`, CONFIRM_ACTIONS_KEYBOARD);
     return;
   }
 
   if (data === "send") {
-    if (submission.photo_file_ids.length === 0) {
-      await answerCallbackQuery(callbackQuery.id, "Нет фото для отправки");
-      return;
-    }
-
     await answerCallbackQuery(callbackQuery.id);
-    try {
-      await sendSubmissionToTarget(submission);
-      submission.status = "sent";
-      submission.last_error = null;
-      submission.photos_prompt_message_id = null;
-      await updateSubmission(submission);
-      await sendMessage(chatId, "Фото доставлены, спасибо!", START_KEYBOARD);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      submission.status = "failed";
-      submission.attempts += 1;
-      submission.last_error = errorMessage;
-      await updateSubmission(submission);
-      console.error(
-        "submission_delivery_error",
-        JSON.stringify({
-          submission_id: submission.id,
-          photo_count: submission.photo_file_ids.length,
-          target_chat_id: targetChatId,
-          error: errorMessage,
-        }),
-      );
-      await sendMessage(
-        chatId,
-        "Не удалось доставить фото в группу. Нажмите «Повторить отправку» или «Отмена».",
-        RETRY_ACTIONS_KEYBOARD,
-      );
-    }
+    await sendSubmissionAndFinalize(submission, chatId);
     return;
   }
 
@@ -716,7 +730,7 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   if (submission.status === "failed") {
-    if (text === "Повторить отправку") {
+    if (text === "📤 Отправить в группу") {
       if (submission.photo_file_ids.length === 0) {
         await sendPhotosCollectionPrompt(submission, chatId, 0);
         submission.status = "collecting";
@@ -724,32 +738,14 @@ async function handleMessage(message: TelegramMessage) {
         return;
       }
 
-      try {
-        await sendSubmissionToTarget(submission);
-        submission.status = "sent";
-        submission.last_error = null;
-        await updateSubmission(submission);
-        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        submission.attempts += 1;
-        submission.last_error = errorMessage;
-        await updateSubmission(submission);
-        console.error(
-          "submission_delivery_error",
-          JSON.stringify({
-            submission_id: submission.id,
-            photo_count: submission.photo_file_ids.length,
-            target_chat_id: targetChatId,
-            error: errorMessage,
-          }),
-        );
-        await sendMessage(
-          userId,
-          "Не удалось доставить фото в группу. Проверьте и нажмите «Повторить отправку», либо отмените заявку.",
-          RETRY_ACTIONS_KEYBOARD,
-        );
-      }
+      await sendSubmissionAndFinalize(submission, userId);
+      return;
+    }
+
+    if (text === "➕ Добавить ещё фото") {
+      submission.status = "collecting";
+      await updateSubmission(submission);
+      await sendPhotosCollectionPrompt(submission, chatId, submission.photo_file_ids.length);
       return;
     }
 
@@ -757,60 +753,31 @@ async function handleMessage(message: TelegramMessage) {
     if (photoResult) {
       submission.status = "collecting";
       await updateSubmission(submission);
-      if (photoResult.added) {
-        await sendPhotosCollectionPrompt(submission, chatId, photoResult.photoCount);
-      }
       return;
     }
 
     await sendMessage(
       userId,
-      "Последняя отправка не удалась. Нажмите «Повторить отправку» или «Отмена».",
+      "Не удалось отправить фото, попробуйте ещё раз",
       RETRY_ACTIONS_KEYBOARD,
     );
     return;
   }
 
   if (submission.status === "confirming") {
-    if (text === "➕ Добавить фото") {
+    if (text === "➕ Добавить ещё фото") {
       submission.status = "collecting";
       await updateSubmission(submission);
       await sendPhotosCollectionPrompt(submission, chatId, submission.photo_file_ids.length);
       return;
     }
 
-    if (text === "✅ Отправить") {
-      try {
-        await sendSubmissionToTarget(submission);
-        submission.status = "sent";
-        submission.last_error = null;
-        await updateSubmission(submission);
-        await sendMessage(userId, "Фото доставлены, спасибо!", START_KEYBOARD);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        submission.status = "failed";
-        submission.attempts += 1;
-        submission.last_error = errorMessage;
-        await updateSubmission(submission);
-        console.error(
-          "submission_delivery_error",
-          JSON.stringify({
-            submission_id: submission.id,
-            photo_count: submission.photo_file_ids.length,
-            target_chat_id: targetChatId,
-            error: errorMessage,
-          }),
-        );
-        await sendMessage(
-          userId,
-          "Не удалось доставить фото в группу. Нажмите «Повторить отправку» или «Отмена».",
-          RETRY_ACTIONS_KEYBOARD,
-        );
-      }
+    if (text === "📤 Отправить в группу") {
+      await sendSubmissionAndFinalize(submission, userId);
       return;
     }
 
-    await sendMessage(userId, "Используйте кнопки под сообщением со статусом фото.");
+    await sendMessage(userId, "Выберите действие кнопками ниже.", CONFIRM_ACTIONS_KEYBOARD);
     return;
   }
 
@@ -968,20 +935,28 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   if (step === "await_photos") {
-    if (text === "Готово ✅") {
-      await sendMessage(userId, "Используйте кнопку «✅ Готово» под сообщением со статусом фото.");
+    if (text === "✅ Готово") {
+      if (submission.photo_file_ids.length === 0) {
+        await sendPhotosCollectionPrompt(submission, chatId, 0);
+        return;
+      }
+
+      submission.status = "confirming";
+      await updateSubmission(submission);
+      await sendMessage(
+        userId,
+        `Получено фото: ${submission.photo_file_ids.length}. Что делаем дальше?`,
+        CONFIRM_ACTIONS_KEYBOARD,
+      );
       return;
     }
 
     const photoResult = await handleIncomingPhoto(submission, message, userId);
     if (photoResult && photoResult.handled) {
-      if (photoResult.added) {
-        await sendPhotosCollectionPrompt(submission, chatId, photoResult.photoCount);
-      }
       return;
     }
 
-    await sendMessage(userId, "Ожидаю фото. Для завершения используйте inline-кнопку «✅ Готово» под сообщением.");
+    await sendMessage(userId, "Ожидаю фото. Для завершения нажмите «✅ Готово».", PHOTO_COLLECTION_KEYBOARD);
     return;
   }
 
